@@ -574,6 +574,11 @@ class ShipmentTrackingCard extends HTMLElement {
         }
 
         let locationName = attrs.location || attrs.current_location;
+        const pointNumber = raw.pickUpPoint?.name || raw.pickupLocation?.name;
+        if (pointNumber) {
+          locationName = locationName ? `${pointNumber} - ${locationName}` : pointNumber;
+        }
+      
         if (locationName && courier === 'inpost' && raw.pickUpPoint?.locationDescription) {
           locationName += ' (' + raw.pickUpPoint.locationDescription + ')';
         }
@@ -835,7 +840,12 @@ class ShipmentTrackingCard extends HTMLElement {
         }
 
         const statusInfo = this.getStatusInfo(stateObj);
-        const location = attributes.location || attributes.current_location || '';
+        const pointName = attributes.raw_response ? JSON.parse(attributes.raw_response).pickUpPoint?.name : null;
+        let location = attributes.location || attributes.current_location || '';
+        if (pointName) {
+            location = `<strong>${pointName}</strong> - ${location}`;
+        }
+        
         const pickupCode = attributes.open_code || attributes.pickup_code || '';
 
         let extraInfoHtml = '';
