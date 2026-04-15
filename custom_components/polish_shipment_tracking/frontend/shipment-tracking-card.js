@@ -727,11 +727,28 @@ class ShipmentTrackingCard extends HTMLElement {
   updateContent() {
     if (!this.content || !this._hass) return;
 
-    const entitiesToShow = Object.keys(this._hass.states).filter((entityId) => {
-      if (!entityId.startsWith("sensor.")) return false;
-      const stateObj = this._hass.states[entityId];
-      return stateObj?.attributes?.integration_domain === "polish_shipment_tracking";
-    });
+    let entitiesToShow = [];
+    const configEntities = this.config.entity_id;
+
+    if (configEntities) {
+      if (Array.isArray(configEntities)) {
+        entitiesToShow = Object.keys(this._hass.states).filter((id) => {
+          return configEntities.some(prefix => id.startsWith(prefix)) && 
+                 this._hass.states[id].attributes?.tracking_number;
+        });
+      } else if (typeof configEntities === 'string') {
+        entitiesToShow = Object.keys(this._hass.states).filter((id) => {
+          return id.startsWith(configEntities) && 
+                 this._hass.states[id].attributes?.tracking_number;
+        });
+      }
+    } else {
+      entitiesToShow = Object.keys(this._hass.states).filter((entityId) => {
+        if (!entityId.startsWith("sensor.")) return false;
+        const stateObj = this._hass.states[entityId];
+        return stateObj?.attributes?.integration_domain === "polish_shipment_tracking";
+      });
+    }
 
     entitiesToShow.sort((a, b) => {
         const keyA = (this._hass.states[a]?.attributes?.status_key || '').toString().toLowerCase();
@@ -901,6 +918,11 @@ class ShipmentTrackingCardEditor extends HTMLElement {
         label: this._localize("editor.title"),
         selector: { text: {} }
       },
+      {
+        name: "entity_id",
+        label: "Filtruj prefixy encji (lista)",
+        selector: { object: {} }
+      }
       {
         name: "show_list_pickup_code",
         label: this._localize("editor.show_list_pickup_code"),
