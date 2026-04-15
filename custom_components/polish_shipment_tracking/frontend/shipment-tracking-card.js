@@ -128,39 +128,41 @@ class ShipmentTrackingCard extends HTMLElement {
           }
           .shipment-item {
             display: flex;
-            align-items: flex-start;
+            align-items: center;
             padding: 12px;
-            background: var(--secondary-background-color);
+            background: transparent; 
+            border: 1px solid var(--divider-color, rgba(255, 255, 255, 0.1));
             border-radius: 12px;
+            margin-bottom: 12px;
             transition: all 0.2s ease-in-out;
-            border: 1px solid transparent;
             position: relative;
             cursor: pointer;
           }
           .shipment-item:hover {
             border-color: var(--primary-color);
+            background: rgba(var(--rgb-primary-color), 0.04);
           }
           .icon-container {
-            width: 48px;
-            height: 48px;
-            border-radius: 50%;
-            background: white;
+            width: 56px;
+            height: 56px;
+            flex-shrink: 0;
+            margin-right: 16px;
             display: flex;
             align-items: center;
             justify-content: center;
-            margin-right: 16px;
-            font-size: 24px;
-            color: var(--primary-color);
-            flex-shrink: 0;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+            /* Usuwamy background: white i box-shadow */
+            background: rgba(var(--rgb-primary-text-color), 0.03); 
+            border-radius: 12px; /* Zmieniamy z 50% (koło) na zaokrąglony kwadrat */
             overflow: hidden;
             position: relative;
-            margin-top: 2px;
           }
           .icon-container img {
-            width: 70%;
-            height: 70%;
+            width: 85%;
+            height: 85%;
             object-fit: contain;
+          }
+          .icon-container ha-icon {
+            --mdc-icon-size: 32px;
           }
           .content-right {
             flex-grow: 1;
