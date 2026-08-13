@@ -17,7 +17,12 @@ from .const import (
     CONF_REFRESH_EXPIRES_AT,
     CONF_COURIER,
     CONF_DEVICE_UID,
+    CONF_ID_TOKEN,
+    CONF_SESSION_ID,
+    CONF_SESSION_REGISTERED,
 )
+from .helpers import get_parcel_detail_id, get_parcel_id
+from .helpers import is_delivered
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -85,12 +90,24 @@ class ShipmentCoordinator(DataUpdateCoordinator):
             api._expires_at = data.get(CONF_TOKEN_EXPIRES_AT, 0) or 0
             api._refresh_expires_at = data.get(CONF_REFRESH_EXPIRES_AT, 0) or 0
             return api
+
+        elif self.courier == "gls":
+            from .api_gls import GlsApi
+            api = GlsApi(self.session, session_id=data.get(CONF_SESSION_ID))
+            api._token = token
+            api._refresh_token = refresh_token
+            api._id_token = data.get(CONF_ID_TOKEN)
+            api._expires_at = data.get(CONF_TOKEN_EXPIRES_AT, 0) or 0
+            api._session_registered = data.get(CONF_SESSION_REGISTERED)
+            return api
         return None
 
     async def _async_update_data(self):
         """Fetch data from API."""
         try:
-            return await self._fetch_parcels_with_retry()
+            parcels = await self._fetch_parcels_with_retry()
+            filtered = self._filter_active_parcels(parcels)
+            return filtered
         except Exception as err:
             _LOGGER.error("Error fetching data for %s: %s", self.courier, err)
             raise UpdateFailed(f"Error communicating with API: {err}")
@@ -106,6 +123,17 @@ class ShipmentCoordinator(DataUpdateCoordinator):
                 return await self._fetch_parcels()
             raise e
 
+    async def _fetch_single_parcel_with_retry(self, tracking_number: str):
+        """Fetch one parcel and retry once if unauthorized."""
+        try:
+            return await self._fetch_single_parcel(tracking_number)
+        except Exception as e:
+            if "401" in str(e) or "unauthorized" in str(e).lower():
+                _LOGGER.info("%s token expired while fetching single parcel, refreshing...", self.courier)
+                await self._refresh_token()
+                return await self._fetch_single_parcel(tracking_number)
+            raise e
+
     async def _fetch_parcels(self):
         """Fetch parcels from API without retry logic."""
         if self.courier == "inpost":
@@ -114,11 +142,19 @@ class ShipmentCoordinator(DataUpdateCoordinator):
             
         elif self.courier == "dpd":
             data = await self.api.get_parcels()
-            if isinstance(data, list): return data
-            if "packages" in data: return data["packages"]
-            if "parcelList" in data: return data["parcelList"]
-            if "shipments" in data: return data["shipments"]
-            return []
+            parcels = []
+            if isinstance(data, list):
+                parcels = data
+            elif isinstance(data, dict):
+                if "packages" in data:
+                    parcels = data["packages"]
+                elif "parcelList" in data:
+                    parcels = data["parcelList"]
+                elif "shipments" in data:
+                    parcels = data["shipments"]
+            if not parcels:
+                return []
+            return await self._enrich_dpd_parcels(parcels)
             
         elif self.courier == "dhl":
             data = await self.api.get_parcels()
@@ -142,11 +178,7 @@ class ShipmentCoordinator(DataUpdateCoordinator):
             for parcel in parcels:
                 detail_id = None
                 if isinstance(parcel, dict):
-                    detail_id = (
-                        parcel.get("id")
-                        or parcel.get("trackingId")
-                        or parcel.get("trackingID")
-                    )
+                    detail_id = get_parcel_detail_id(parcel, self.courier)
                 if detail_id is None:
                     detail_tasks.append(asyncio.sleep(0, result=None))
                 else:
@@ -168,8 +200,222 @@ class ShipmentCoordinator(DataUpdateCoordinator):
                 else:
                     enriched.append(parcel)
             return enriched
-        
+
+        elif self.courier == "gls":
+            data = await self.api.get_parcels()
+            self._persist_gls_auth_if_changed()
+            parcels = []
+            if isinstance(data, list):
+                parcels = data
+            elif isinstance(data, dict):
+                for key in ("items", "shipments", "data", "content", "packages", "parcels"):
+                    if isinstance(data.get(key), list):
+                        parcels = data[key]
+                        break
+            if not parcels:
+                return []
+
+            detail_tasks = []
+            for parcel in parcels:
+                tracking_uid = parcel.get("trackingUid") if isinstance(parcel, dict) else None
+                if tracking_uid is None:
+                    detail_tasks.append(asyncio.sleep(0, result=None))
+                else:
+                    detail_tasks.append(self.api.get_parcel(tracking_uid))
+
+            details_results = await asyncio.gather(*detail_tasks, return_exceptions=True)
+            self._persist_gls_auth_if_changed()
+            enriched = []
+            for parcel, details in zip(parcels, details_results):
+                if isinstance(details, Exception):
+                    uid = parcel.get("trackingUid") if isinstance(parcel, dict) else None
+                    _LOGGER.debug("GLS detail fetch failed for %s: %s", uid, details)
+                    enriched.append(parcel)
+                    continue
+                if details is None:
+                    enriched.append(parcel)
+                    continue
+                if not isinstance(parcel, dict) or not isinstance(details, dict):
+                    enriched.append(parcel)
+                    continue
+                merged = dict(parcel)
+                tracking_shipment = details.get("trackingShipment")
+                if isinstance(tracking_shipment, dict):
+                    merged.update(tracking_shipment)
+                merged.update(details)
+                merged["_raw_response"] = details
+                enriched.append(merged)
+            return enriched
+
         return []
+
+    async def _enrich_dpd_parcels(self, parcels):
+        """Fetch DPD parcel details to expose fields missing from the list endpoint."""
+        semaphore = asyncio.Semaphore(5)
+
+        async def _fetch_details(parcel):
+            if not isinstance(parcel, dict):
+                return parcel
+
+            tracking_number = get_parcel_id(parcel, self.courier)
+            if not tracking_number:
+                return parcel
+
+            try:
+                async with semaphore:
+                    details = await self.api.get_parcel(tracking_number)
+            except Exception as err:
+                _LOGGER.debug(
+                    "Failed to fetch DPD parcel details for %s, keeping list payload: %s",
+                    tracking_number,
+                    err,
+                )
+                return parcel
+
+            detail_parcel = self._extract_single_parcel(details, tracking_number)
+            if not isinstance(detail_parcel, dict):
+                return parcel
+
+            merged = dict(parcel)
+            merged.update(detail_parcel)
+            merged["_raw_response"] = detail_parcel
+            return merged
+
+        details_results = await asyncio.gather(
+            *(_fetch_details(parcel) for parcel in parcels),
+            return_exceptions=True,
+        )
+
+        enriched = []
+        for parcel, result in zip(parcels, details_results):
+            if isinstance(result, Exception):
+                enriched.append(parcel)
+            else:
+                enriched.append(result)
+        return enriched
+
+    def _get_gls_tracking_uid(self, shipment_no: str) -> str | None:
+        """Return the trackingUid for a GLS shipment identified by shipmentNo."""
+        for parcel in (self.data or []):
+            if not isinstance(parcel, dict):
+                continue
+            ts = parcel.get("trackingShipment")
+            candidates = [parcel, ts] if isinstance(ts, dict) else [parcel]
+            for candidate in candidates:
+                if str(candidate.get("shipmentNo") or "") == str(shipment_no):
+                    uid = candidate.get("trackingUid")
+                    if uid:
+                        return str(uid)
+        return None
+
+    async def _fetch_single_parcel(self, tracking_number: str):
+        """Fetch a single parcel details for couriers that support it."""
+        if self.courier in {"inpost", "dpd", "dhl", "gls"}:
+            if not hasattr(self.api, "get_parcel"):
+                return None
+            if self.courier == "gls":
+                uid = self._get_gls_tracking_uid(tracking_number)
+                if not uid:
+                    _LOGGER.debug("GLS: cannot find trackingUid for shipmentNo=%s", tracking_number)
+                    return None
+                data = await self.api.get_parcel(uid)
+                self._persist_gls_auth_if_changed()
+            else:
+                data = await self.api.get_parcel(tracking_number)
+            return self._extract_single_parcel(data, tracking_number)
+
+        if self.courier == "pocztex":
+            if not hasattr(self.api, "get_parcel_details"):
+                return None
+            detail_id = tracking_number
+            current_data = self.data or []
+            existing_parcel = next(
+                (
+                    item
+                    for item in current_data
+                    if str(get_parcel_id(item, self.courier) or "") == str(tracking_number)
+                ),
+                None,
+            )
+            if isinstance(existing_parcel, dict):
+                detail_id = get_parcel_detail_id(existing_parcel, self.courier) or tracking_number
+
+            data = await self.api.get_parcel_details(detail_id)
+            if not isinstance(data, dict):
+                return None
+            merged = dict(existing_parcel) if isinstance(existing_parcel, dict) else {}
+            merged.update(data)
+            merged["_raw_response"] = data
+            return merged
+
+        return None
+
+    def _extract_single_parcel(self, data, tracking_number: str):
+        """Extract a single parcel dict from varied courier response formats."""
+        if isinstance(data, dict):
+            candidate_dicts = [data]
+            for key in ("parcel", "shipment", "package", "data", "item"):
+                nested = data.get(key)
+                if isinstance(nested, dict):
+                    candidate_dicts.append(nested)
+                elif isinstance(nested, list):
+                    candidate_dicts.extend([x for x in nested if isinstance(x, dict)])
+            for candidate in candidate_dicts:
+                if str(get_parcel_id(candidate, self.courier) or "") == str(tracking_number):
+                    return candidate
+            return data
+
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict) and str(get_parcel_id(item, self.courier) or "") == str(tracking_number):
+                    return item
+            return None
+
+        return None
+
+    def _filter_active_parcels(self, parcels):
+        """Keep only active parcels in coordinator data."""
+        if not isinstance(parcels, list):
+            return []
+        return [
+            parcel
+            for parcel in parcels
+            if isinstance(parcel, dict) and not is_delivered(parcel, self.courier)
+        ]
+
+    async def async_refresh_parcel(self, tracking_number: str) -> None:
+        """Refresh a single parcel when courier API supports it.
+
+        Falls back to full coordinator refresh if single fetch fails or returns unknown shape.
+        """
+        try:
+            parcel = await self._fetch_single_parcel_with_retry(tracking_number)
+        except Exception as err:
+            _LOGGER.debug(
+                "Single parcel refresh failed for %s %s, falling back to full refresh: %s",
+                self.courier,
+                tracking_number,
+                err,
+            )
+            await self.async_request_refresh()
+            return
+
+        if not isinstance(parcel, dict):
+            await self.async_request_refresh()
+            return
+
+        current_data = list(self.data or [])
+        replaced = False
+        for idx, item in enumerate(current_data):
+            if str(get_parcel_id(item, self.courier) or "") == str(tracking_number):
+                current_data[idx] = parcel
+                replaced = True
+                break
+
+        if not replaced:
+            current_data.append(parcel)
+
+        self.async_set_updated_data(self._filter_active_parcels(current_data))
 
     async def _refresh_token(self):
         """Refresh API token and update config entry."""
@@ -204,7 +450,36 @@ class ShipmentCoordinator(DataUpdateCoordinator):
                 CONF_TOKEN_EXPIRES_AT: self.api._expires_at,
                 CONF_REFRESH_EXPIRES_AT: self.api._refresh_expires_at,
             }
+        elif self.courier == "gls":
+            await self.api.refresh_token()
+            await self.api.ensure_session()
+            new_data = {
+                **self.entry.data,
+                CONF_TOKEN: self.api._token,
+                CONF_REFRESH_TOKEN: self.api._refresh_token,
+                CONF_ID_TOKEN: self.api._id_token,
+                CONF_TOKEN_EXPIRES_AT: self.api._expires_at,
+                CONF_SESSION_ID: self.api._session_id,
+                CONF_SESSION_REGISTERED: self.api._session_registered,
+            }
         else:
             return
 
         self.hass.config_entries.async_update_entry(self.entry, data=new_data)
+
+    def _persist_gls_auth_if_changed(self):
+        """Persist GLS auth/session changes made during automatic refresh."""
+        if self.courier != "gls":
+            return
+
+        new_data = {
+            **self.entry.data,
+            CONF_TOKEN: self.api._token,
+            CONF_REFRESH_TOKEN: self.api._refresh_token,
+            CONF_ID_TOKEN: self.api._id_token,
+            CONF_TOKEN_EXPIRES_AT: self.api._expires_at,
+            CONF_SESSION_ID: self.api._session_id,
+            CONF_SESSION_REGISTERED: self.api._session_registered,
+        }
+        if new_data != self.entry.data:
+            self.hass.config_entries.async_update_entry(self.entry, data=new_data)

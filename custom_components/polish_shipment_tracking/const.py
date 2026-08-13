@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Final
 
 DOMAIN = "polish_shipment_tracking"
-PLATFORMS = ["sensor"]
+PLATFORMS = ["sensor", "button"]
 
 CONF_COURIER = "courier"
 CONF_PHONE = "phone"
@@ -14,6 +14,9 @@ CONF_REFRESH_TOKEN = "refresh_token"
 CONF_TOKEN_EXPIRES_AT = "token_expires_at"
 CONF_REFRESH_EXPIRES_AT = "refresh_expires_at"
 CONF_DEVICE_UID = "device_uid"
+CONF_ID_TOKEN = "id_token"
+CONF_SESSION_ID = "session_id"
+CONF_SESSION_REGISTERED = "session_registered"
 
 # --- Frontend registration constants ---
 _MANIFEST_PATH: Final[Path] = Path(__file__).parent / "manifest.json"

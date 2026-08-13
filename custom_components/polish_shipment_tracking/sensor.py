@@ -82,21 +82,52 @@ async def async_setup_entry(
             "status_key": normalize_status(raw_status, coordinator.courier),
         }
 
+    has_initialized = False
 
     @callback
     def async_update_parcels() -> None:
         """Add new sensors and remove old ones."""
+        nonlocal has_initialized
         current_data = coordinator.data or []
+        _LOGGER.debug(
+            "async_update_parcels [%s]: coordinator.data has %d items, known_parcels=%s",
+            coordinator.courier,
+            len(current_data),
+            coordinator.known_parcels,
+        )
         new_entities = []
+        registry = async_get_entity_registry(hass)
         
         current_ids = set()
         for parcel in current_data:
             pid = get_parcel_id(parcel, coordinator.courier)
-            if not pid or is_delivered(parcel, coordinator.courier):
+            delivered = is_delivered(parcel, coordinator.courier)
+            _LOGGER.debug(
+                "async_update_parcels [%s]: parcel pid=%s delivered=%s",
+                coordinator.courier,
+                pid,
+                delivered,
+            )
+            if not pid or delivered:
                 continue
             
             current_ids.add(pid)
             if pid not in coordinator.known_parcels:
+                unique_id = f"{coordinator.courier}_{pid}"
+                existing_entity_id = registry.async_get_entity_id("sensor", DOMAIN, unique_id)
+                if existing_entity_id is not None:
+                    existing_entry = registry.async_get(existing_entity_id)
+                    if existing_entry and existing_entry.config_entry_id == entry.entry_id:
+                        # Entity belongs to this config entry - still create runtime entity.
+                        coordinator.known_parcels.add(pid)
+                        new_entities.append(ShipmentSensor(coordinator, parcel, pid))
+                        continue
+                    _LOGGER.debug(
+                        "Skipping duplicate shipment entity for %s (already exists as %s)",
+                        unique_id,
+                        existing_entity_id,
+                    )
+                    continue
                 coordinator.known_parcels.add(pid)
                 new_entities.append(ShipmentSensor(coordinator, parcel, pid))
         
@@ -104,18 +135,20 @@ async def async_setup_entry(
             async_add_entities(new_entities)
             # Fire events for newly detected shipments.
             # If HA isn't running yet, queue and flush after startup.
-            for new_sensor in new_entities:
-                _queue_or_fire_event(
-                    hass,
-                    f"{DOMAIN}_new_shipment",
-                    _build_new_shipment_event_data(new_sensor),
-                )
+            if has_initialized:
+                for new_sensor in new_entities:
+                    _queue_or_fire_event(
+                        hass,
+                        f"{DOMAIN}_new_shipment",
+                        _build_new_shipment_event_data(new_sensor),
+                    )
 
         # Remove entities that are no longer present
         _async_remove_old_entities(hass, entry, coordinator, current_ids)
         
         # Keep track of active parcels for this coordinator
         coordinator.known_parcels.intersection_update(current_ids)
+        has_initialized = True
 
     entry.async_on_unload(coordinator.async_add_listener(async_update_parcels))
     async_update_parcels()
@@ -190,6 +223,7 @@ class ShipmentSensor(CoordinatorEntity[ShipmentCoordinator], SensorEntity):
             "courier": self._courier,
             "tracking_number": self._tracking_number,
             "integration_domain": DOMAIN,
+            "account_contact": self._get_account_contact(),
         }
         
         raw_status = get_raw_status(self.parcel_data, self._courier)
@@ -209,8 +243,17 @@ class ShipmentSensor(CoordinatorEntity[ShipmentCoordinator], SensorEntity):
             self._add_dpd_attributes(attrs)
         elif self._courier == "pocztex":
             self._add_pocztex_attributes(attrs)
+        elif self._courier == "gls":
+            self._add_gls_attributes(attrs)
             
         return attrs
+
+    def _get_account_contact(self) -> str | None:
+        """Return the integration account identifier shown to the carrier."""
+        entry_data = self.coordinator.entry.data
+        if self._courier == "pocztex":
+            return entry_data.get(CONF_EMAIL)
+        return entry_data.get(CONF_PHONE) or entry_data.get(CONF_EMAIL)
 
     def _add_inpost_attributes(self, attrs: dict) -> None:
         """Add InPost specific attributes."""
@@ -251,6 +294,64 @@ class ShipmentSensor(CoordinatorEntity[ShipmentCoordinator], SensorEntity):
         history = self.parcel_data.get("history")
         if isinstance(history, list):
             attrs["history"] = history
+
+    def _add_gls_attributes(self, attrs: dict) -> None:
+        """Add GLS specific attributes."""
+        data = self.parcel_data
+        tracking_shipment = data.get("trackingShipment")
+        if isinstance(tracking_shipment, dict):
+            data = tracking_shipment
+
+        attrs["tracking_uid"] = data.get("trackingUid")
+        attrs["shipment_no"] = data.get("shipmentNo")
+        attrs["tracking_id"] = data.get("trackingId")
+        attrs["state_date"] = data.get("stateDate")
+        attrs["package_amount"] = data.get("packageAmount")
+        attrs["weight"] = data.get("weight")
+        attrs["pin"] = data.get("pin")
+        attrs["reference"] = data.get("reference")
+        attrs["courier_phone_number"] = data.get("courierPhoneNumber")
+        attrs["delivery_method"] = data.get("deliveryMethod")
+        attrs["payment_flag"] = data.get("paymentFlag")
+        attrs["delivery_flag"] = data.get("deliveryFlag")
+
+        sender = data.get("sender")
+        if isinstance(sender, dict):
+            attrs["sender_name"] = sender.get("shipmentName")
+        elif data.get("senderName") is not None:
+            attrs["sender_name"] = data.get("senderName")
+
+        receiver = data.get("receiver")
+        if isinstance(receiver, dict):
+            attrs["receiver_name"] = receiver.get("shipmentName")
+        elif data.get("receiverName") is not None:
+            attrs["receiver_name"] = data.get("receiverName")
+
+        parcel_shop = data.get("parcelShop")
+        if isinstance(parcel_shop, dict):
+            attrs["parcel_shop_name"] = parcel_shop.get("shipmentName")
+            attrs["parcel_shop_type"] = parcel_shop.get("parcelShopType")
+            address = [
+                parcel_shop.get("street"),
+                parcel_shop.get("postalCode"),
+                parcel_shop.get("city"),
+            ]
+            attrs["location"] = ", ".join(str(part) for part in address if part)
+        elif data.get("parcelShopType") is not None:
+            attrs["parcel_shop_type"] = data.get("parcelShopType")
+
+        packages = self.parcel_data.get("trackingShipmentPackages") or data.get("shipmentPackages")
+        if isinstance(packages, list):
+            attrs["packages"] = packages
+            attrs["package_count"] = len(packages)
+            history = []
+            for pkg in packages:
+                if isinstance(pkg, dict):
+                    statuses = pkg.get("packageStatuses")
+                    if isinstance(statuses, list):
+                        history.extend(statuses)
+            if history:
+                attrs["history"] = history
 
     @callback
     def _handle_coordinator_update(self) -> None:
