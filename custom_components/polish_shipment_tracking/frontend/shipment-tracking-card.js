@@ -8,6 +8,7 @@ const CARD_TRANSLATIONS = {
     "meta.name": "Shipment Tracking Card",
     "meta.description": "Displays shipment tracking sensors with status badges.",
     "editor.title": "Title",
+    "editor.prefix_entities": "Filter entities (substring or list)",
     "editor.show_list_pickup_code": "Show pickup code in list",
     "editor.show_list_location": "Show pickup point in list",
     "editor.show_dialog_sender": "Show sender in details",
@@ -68,6 +69,7 @@ const CARD_TRANSLATIONS = {
     "meta.name": "Karta śledzenia przesyłek",
     "meta.description": "Wyświetla sensory śledzenia przesyłek z etykietami statusu.",
     "editor.title": "Tytuł",
+    "editor.prefix_entities": "Filtruj encje (fragment lub lista)",
     "editor.show_list_pickup_code": "Pokaż kod odbioru na liście",
     "editor.show_list_location": "Pokaż lokalizację na liście",
     "editor.show_dialog_sender": "Pokaż nadawcę w szczegółach",
@@ -1219,20 +1221,17 @@ class ShipmentTrackingCard extends HTMLElement {
     if (!this.content || !this._hass) return;
 
     let entitiesToShow = [];
-    const configEntities = this.config.entity_id;
-
+    const configEntities = this.config.prefix_entities;
+    
     if (configEntities) {
-      if (Array.isArray(configEntities)) {
-        entitiesToShow = Object.keys(this._hass.states).filter((id) => {
-          return configEntities.some(prefix => id.startsWith(prefix)) && 
-                 this._hass.states[id].attributes?.tracking_number;
-        });
-      } else if (typeof configEntities === 'string') {
-        entitiesToShow = Object.keys(this._hass.states).filter((id) => {
-          return id.startsWith(configEntities) && 
-                 this._hass.states[id].attributes?.tracking_number;
-        });
-      }
+      const prefixes = Array.isArray(configEntities)
+        ? configEntities
+        : [configEntities];
+    
+      entitiesToShow = Object.keys(this._hass.states).filter((id) => {
+        return prefixes.some(prefix => id.includes(prefix)) &&
+               this._hass.states[id]?.attributes?.tracking_number;
+      });
     } else {
       entitiesToShow = Object.keys(this._hass.states).filter((entityId) => {
         if (!entityId.startsWith("sensor.")) return false;
@@ -1418,10 +1417,10 @@ class ShipmentTrackingCardEditor extends HTMLElement {
         selector: { text: {} }
       },
       {
-        name: "entity_id",
-        label: "Filtruj prefixy encji (lista)",
+        name: "prefix_entities",
+        label: this._localize("editor.prefix_entities"),
         selector: { object: {} }
-      }
+      },
       {
         name: "show_list_pickup_code",
         label: this._localize("editor.show_list_pickup_code"),
